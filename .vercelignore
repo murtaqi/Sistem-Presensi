@@ -5,4 +5,5 @@ verify.py
 BELAJAR_MVC.md
 TESTING.md
 migration-data.json
-.env.local
+.env*
+*.tsbuildinfo
