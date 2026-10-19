@@ -43,7 +43,7 @@ export async function createUser(form: FormData) {
     const identifier = field(form, 'identifier').toLowerCase();
     const email = loginEmail(identifier);
     const role = z.enum(roles).parse(field(form, 'role'));
-    const password = z.string().min(10).max(128).parse(String(form.get('password') ?? ''));
+    const password = z.string().min(6).max(128).parse(String(form.get('password') ?? ''));
     const admin = adminClient();
     const { data, error } = await admin.auth.admin.createUser({ email, password, email_confirm: true });
     if (error) throw error;
@@ -54,6 +54,59 @@ export async function createUser(form: FormData) {
     }
   } catch (error) { finish('/users', errorMessage(error), true); }
   finish('/users', 'Pengguna berhasil dibuat.');
+}
+async function checkUserLinks(userId: string, role?: string) {
+  const admin = adminClient();
+  const tables = role === undefined
+    ? [['classes', 'lecturer_id'], ['attendance', 'student_id'], ['attempts', 'student_id']]
+    : role === 'dosen' ? [] : [['classes', 'lecturer_id']];
+  if (role !== undefined && role !== 'mahasiswa') tables.push(['enrollments', 'student_id'], ['attendance', 'student_id'], ['attempts', 'student_id']);
+  const results = await Promise.all(tables.map(([table, column]) => admin.from(table).select('*', { count: 'exact', head: true }).eq(column, userId)));
+  for (const result of results) if (result.error) throw result.error;
+  if (results.some(result => (result.count ?? 0) > 0)) {
+    throw new Error(role === undefined
+      ? 'Pengguna masih terkait kelas atau riwayat presensi. Data tersebut harus tetap disimpan.'
+      : 'Peran tidak dapat diganti selama pengguna masih terkait kelas, peserta, atau riwayat presensi.');
+  }
+}
+export async function updateUser(form: FormData) {
+  const { user } = await requireUser(['admin']);
+  try {
+    const userId = z.uuid().parse(field(form, 'id'));
+    const name = z.string().min(1).max(160).parse(field(form, 'name'));
+    const identifier = field(form, 'identifier').toLowerCase();
+    const email = loginEmail(identifier);
+    const role = z.enum(roles).parse(field(form, 'role'));
+    const passwordValue = String(form.get('password') ?? '');
+    const password = passwordValue ? z.string().min(6).max(128).parse(passwordValue) : undefined;
+    if (userId === user.id && role !== 'admin') throw new Error('Anda tidak dapat mengubah peran akun sendiri.');
+    const admin = adminClient();
+    const { data: current, error } = await admin.from('profiles').select('id,role').eq('id', userId).single();
+    if (error || !current) throw new Error('Pengguna tidak ditemukan.');
+    if (current.role !== role) await checkUserLinks(userId, role);
+    const { data: duplicate, error: duplicateError } = await admin.from('profiles').select('id').eq('identifier', identifier).neq('id', userId).maybeSingle();
+    if (duplicateError) throw duplicateError;
+    if (duplicate) throw new Error('NIM / NIP sudah digunakan.');
+    // The Auth trigger synchronizes profiles in the same transaction as the email/password update.
+    const { error: updateError } = await admin.auth.admin.updateUserById(userId, {
+      email, email_confirm: true, ...(password ? { password } : {}),
+      app_metadata: { presensi_profile: { name, identifier, role } },
+    });
+    if (updateError) throw updateError;
+  } catch (error) { finish('/users', errorMessage(error), true); }
+  finish('/users', 'Pengguna berhasil diperbarui.');
+}
+export async function deleteUser(form: FormData) {
+  const { user } = await requireUser(['admin']);
+  try {
+    const userId = z.uuid().parse(field(form, 'id'));
+    if (userId === user.id) throw new Error('Anda tidak dapat menghapus akun sendiri.');
+    await checkUserLinks(userId);
+    // Auth deletion cascades to the profile; database guards preserve the last admin and history.
+    const { error } = await adminClient().auth.admin.deleteUser(userId);
+    if (error) throw error;
+  } catch (error) { finish('/users', errorMessage(error), true); }
+  finish('/users', 'Pengguna berhasil dihapus.');
 }
 export async function saveClass(form: FormData) {
   const { db, profile } = await requireUser(['admin', 'dosen']);
@@ -97,7 +150,7 @@ export async function closeSession(form: FormData) {
 export async function changePassword(form: FormData) {
   const { db, user } = await requireUser();
   try {
-    const password = z.string().min(10).max(128).parse(String(form.get('password') ?? ''));
+    const password = z.string().min(6).max(128).parse(String(form.get('password') ?? ''));
     const { error: verifyError } = await db.auth.signInWithPassword({ email: user.email!, password: String(form.get('old_password') ?? '') });
     if (verifyError) throw new Error('Kata sandi lama salah.');
     const { error } = await db.auth.updateUser({ password });
